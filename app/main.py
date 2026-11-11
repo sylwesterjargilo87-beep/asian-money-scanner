@@ -118,21 +118,36 @@ def records():
 def volume(window_seconds: int = 60):
     if window_seconds < 1 or window_seconds > 3600:
         raise HTTPException(400, "window_seconds must be between 1 and 3600")
-    cutoff = datetime.now(timezone.utc).timestamp() - window_seconds
+    now = datetime.now(timezone.utc)
+    current_start = datetime.fromtimestamp(now.timestamp() - window_seconds, timezone.utc).isoformat()
+    previous_start = datetime.fromtimestamp(now.timestamp() - 2 * window_seconds, timezone.utc).isoformat()
     with db() as c:
-        rows = c.execute("SELECT payload, created FROM bets WHERE created >= ?", (datetime.fromtimestamp(cutoff, timezone.utc).isoformat(),)).fetchall()
-    totals = {}
-    for row in rows:
-        record = json.loads(row["payload"])
-        currency = record.get("currency", "UNKNOWN")
-        bucket = totals.setdefault(currency, {"currency": currency, "stake_volume": 0.0, "bets": 0})
-        bucket["stake_volume"] += float(record.get("stake", 0))
-        bucket["bets"] += 1
+        current = c.execute("SELECT payload FROM bets WHERE created >= ?", (current_start,)).fetchall()
+        previous = c.execute("SELECT payload FROM bets WHERE created >= ? AND created < ?", (previous_start, current_start)).fetchall()
+    def aggregate(rows):
+        totals = {}
+        for row in rows:
+            record = json.loads(row["payload"])
+            currency = record.get("currency", "UNKNOWN")
+            bucket = totals.setdefault(currency, {"currency": currency, "stake_volume": 0.0, "bets": 0})
+            bucket["stake_volume"] += float(record.get("stake", 0))
+            bucket["bets"] += 1
+        return {k: {"currency": v["currency"], "stake_volume": round(v["stake_volume"], 2), "bets": v["bets"]} for k, v in totals.items()}
+    cur, prev = aggregate(current), aggregate(previous)
+    comparison = []
+    for currency in sorted(set(cur) | set(prev)):
+        a = cur.get(currency, {"stake_volume": 0.0, "bets": 0})
+        b = prev.get(currency, {"stake_volume": 0.0, "bets": 0})
+        delta = round(a["stake_volume"] - b["stake_volume"], 2)
+        pct = round((delta / b["stake_volume"]) * 100, 2) if b["stake_volume"] else None
+        comparison.append({"currency": currency, "current_volume": a["stake_volume"], "previous_volume": b["stake_volume"], "delta": delta, "change_pct": pct, "current_bets": a["bets"], "previous_bets": b["bets"]})
     return {
         "window_seconds": window_seconds,
         "basis": "records_received_by_scanner",
-        "definition": "Sum of unique validated accepted-bet stakes first received during the rolling window; currencies are kept separate, no FX conversion.",
-        "bets_count": len(rows),
-        "by_currency": [{**v, "stake_volume": round(v["stake_volume"], 2)} for v in sorted(totals.values(), key=lambda x: x["currency"])],
-        "as_of": datetime.now(timezone.utc).isoformat()
+        "definition": "Unique accepted-bet records received during the current rolling window compared with the immediately preceding equal-length window; currencies kept separate.",
+        "bets_count": len(current),
+        "by_currency": sorted(cur.values(), key=lambda x: x["currency"]),
+        "previous_bets_count": len(previous),
+        "comparison": comparison,
+        "as_of": now.isoformat()
     }
