@@ -1,0 +1,115 @@
+from __future__ import annotations
+import json, os, sqlite3, urllib.parse, urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field, field_validator
+
+DATA = Path(os.getenv("DATA_DIR", "/data"))
+DATA.mkdir(parents=True, exist_ok=True)
+DB = DATA / "scanner.sqlite3"
+app = FastAPI(title="Asian Money Scanner", version="0.4")
+DEFAULT = {"min_stake_eur":1000,"min_bet_share_pct":20,"min_market_share_pct":85,"min_market_pool_eur":5000,"region":"all","market":"all"}
+
+class Bet(BaseModel):
+    source: str = Field(min_length=2, max_length=100)
+    source_type: str
+    pool_complete: bool = False
+    currency: str = Field(min_length=3, max_length=3)
+    event: str = Field(min_length=3, max_length=200)
+    competition: Optional[str] = None
+    region: Optional[str] = None
+    market: str = Field(min_length=2, max_length=120)
+    selection: str = Field(min_length=1, max_length=120)
+    opposing_selection: Optional[str] = None
+    accepted_at: datetime
+    source_bet_id: str = Field(min_length=1, max_length=200)
+    stake: float = Field(gt=0)
+    odds: Optional[float] = Field(default=None, gt=1)
+    market_pool: Optional[float] = Field(default=None, ge=0)
+    selection_pool: Optional[float] = Field(default=None, ge=0)
+    coverage_description: Optional[str] = None
+    @field_validator("source_type")
+    @classmethod
+    def only_accepted(cls,v):
+        if v != "bookmaker_accepted_bets": raise ValueError("Only validated accepted bookmaker bets are eligible.")
+        return v
+    @field_validator("currency")
+    @classmethod
+    def upper_currency(cls,v): return v.upper()
+
+def db():
+    c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; return c
+
+def init():
+    with db() as c:
+        c.execute("CREATE TABLE IF NOT EXISTS bets(id INTEGER PRIMARY KEY, source TEXT, bet_id TEXT, payload TEXT, created TEXT, UNIQUE(source,bet_id))")
+        c.execute("CREATE TABLE IF NOT EXISTS config(id INTEGER PRIMARY KEY CHECK(id=1), payload TEXT)")
+        c.execute("INSERT OR IGNORE INTO config VALUES(1,?)",(json.dumps(DEFAULT),))
+init()
+
+def cfg():
+    with db() as c: return json.loads(c.execute("SELECT payload FROM config WHERE id=1").fetchone()["payload"])
+
+def assess(b, c):
+    reasons=[]
+    if b.currency!="EUR": reasons.append("Only EUR thresholds are currently evaluated.")
+    elif b.stake<c["min_stake_eur"]: reasons.append("Stake below minimum.")
+    share=side=None
+    if b.pool_complete and b.market_pool and b.market_pool>0 and b.selection_pool is not None:
+        share=b.stake/b.market_pool*100; side=b.selection_pool/b.market_pool*100
+    else: reasons.append("Market pool completeness not verified; percentage alerts blocked.")
+    if share is not None and share<c["min_bet_share_pct"]: reasons.append("Single bet share below threshold.")
+    if side is not None and side<c["min_market_share_pct"]: reasons.append("Selection share below threshold.")
+    if b.currency!="EUR" or b.market_pool is None or b.market_pool<c["min_market_pool_eur"]: reasons.append("Market pool unavailable or below threshold.")
+    if not b.coverage_description: reasons.append("Source coverage description missing.")
+    if c["region"]!="all" and (not b.region or c["region"].lower() not in b.region.lower()): reasons.append("Region filter mismatch.")
+    if c["market"]!="all" and c["market"].lower() not in b.market.lower(): reasons.append("Market filter mismatch.")
+    return {"qualified":not reasons,"bet_share_pct":round(share,2) if share is not None else None,"market_share_pct":round(side,2) if side is not None else None,"reasons":reasons}
+
+def notify(msg):
+    token=os.getenv("TELEGRAM_BOT_TOKEN"); chat=os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat: return False,"Telegram not configured"
+    data=urllib.parse.urlencode({"chat_id":chat,"text":msg}).encode()
+    try:
+        urllib.request.urlopen("https://api.telegram.org/bot"+token+"/sendMessage",data=data,timeout=8).read()
+        return True,"sent"
+    except Exception as e: return False,str(e)
+
+@app.get("/",response_class=HTMLResponse)
+def home(): return HTMLResponse(Path("app/index.html").read_text())
+
+@app.get("/api/health")
+def health():
+    with db() as c: n=c.execute("SELECT COUNT(*) FROM bets").fetchone()[0]
+    return {"status":"ok","version":"0.4","connected_live_sources":0,"telegram_configured":bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID")),"validated_bet_records":n,"message":"No full Asian bookmaker accepted-bets feed is connected."}
+
+@app.get("/api/config")
+def get_config(): return cfg()
+
+@app.post("/api/config")
+def set_config(p:dict):
+    c=cfg()
+    for k in DEFAULT:
+        if k in p: c[k]=p[k]
+    if c["min_stake_eur"]<0 or not 0<=c["min_bet_share_pct"]<=100 or not 50<=c["min_market_share_pct"]<=100 or c["min_market_pool_eur"]<0: raise HTTPException(400,"Invalid thresholds")
+    with db() as x: x.execute("UPDATE config SET payload=? WHERE id=1",(json.dumps(c),))
+    return c
+
+@app.post("/api/ingest")
+def ingest(b:Bet):
+    result=assess(b,cfg())
+    try:
+        with db() as c: c.execute("INSERT INTO bets(source,bet_id,payload,created) VALUES(?,?,?,?)",(b.source,b.source_bet_id,b.model_dump_json(),datetime.now(timezone.utc).isoformat()))
+    except sqlite3.IntegrityError: raise HTTPException(409,"Duplicate source bet ID")
+    sent=False; status="Blocked by validation/threshold rules"
+    if result["qualified"]:
+        sent,status=notify(f"VALIDATED ACCEPTED BET\n{b.event}\n{b.market} — {b.selection}\n{b.stake} {b.currency}\nBet share: {result['bet_share_pct']}%\nSelection share: {result['market_share_pct']}%\nSource: {b.source}\nAccepted: {b.accepted_at.isoformat()}")
+    return {"recorded":True,"assessment":result,"telegram_sent":sent,"telegram_status":status}
+
+@app.get("/api/records")
+def records():
+    with db() as c: rows=c.execute("SELECT payload,created FROM bets ORDER BY id DESC LIMIT 100").fetchall()
+    return [{"record":json.loads(x["payload"]),"received_at":x["created"],"assessment":assess(Bet(**json.loads(x["payload"])),cfg())} for x in rows]
