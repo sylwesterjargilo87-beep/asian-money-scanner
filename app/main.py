@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, os, sqlite3, urllib.parse, urllib.request
+import json, os, sqlite3, urllib.parse, urllib.request, xml.etree.ElementTree as ET, hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -10,7 +10,8 @@ from pydantic import BaseModel, Field, field_validator
 DATA = Path(os.getenv("DATA_DIR", "/data"))
 DATA.mkdir(parents=True, exist_ok=True)
 DB = DATA / "scanner.sqlite3"
-app = FastAPI(title="Asian Money Scanner", version="0.4")
+app = FastAPI(title="Asian Money Scanner", version="0.5")
+TAIL_RSS = os.getenv("TAILBET_RSS_URL", "https://tail.bet/feed.xml")
 DEFAULT = {"min_stake_eur":1000,"min_bet_share_pct":20,"min_market_share_pct":85,"min_market_pool_eur":5000,"region":"all","market":"all"}
 
 class Bet(BaseModel):
@@ -46,6 +47,7 @@ def db():
 def init():
     with db() as c:
         c.execute("CREATE TABLE IF NOT EXISTS bets(id INTEGER PRIMARY KEY, source TEXT, bet_id TEXT, payload TEXT, created TEXT, UNIQUE(source,bet_id))")
+        c.execute("CREATE TABLE IF NOT EXISTS public_observations(id TEXT PRIMARY KEY, source TEXT, title TEXT, link TEXT, published TEXT, summary TEXT, fetched TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS config(id INTEGER PRIMARY KEY CHECK(id=1), payload TEXT)")
         c.execute("INSERT OR IGNORE INTO config VALUES(1,?)",(json.dumps(DEFAULT),))
 init()
@@ -95,13 +97,60 @@ def telegram_startup_test():
         print("TELEGRAM_STARTUP_TEST_FAILED: " + status)
 
 
+
+def refresh_tailbet():
+    req = urllib.request.Request(TAIL_RSS, headers={"User-Agent":"AsianMoneyScanner/0.5 (+public RSS reader)"})
+    with urllib.request.urlopen(req, timeout=15) as response:
+        raw = response.read(2_000_000)
+    root = ET.fromstring(raw)
+    entries = root.findall(".//item") or root.findall(".//{http://www.w3.org/2005/Atom}entry")
+    added = 0
+    fetched = datetime.now(timezone.utc).isoformat()
+    def val(node, tag):
+        el = node.find(tag)
+        if el is None:
+            return ""
+        return (el.text or el.attrib.get("href") or "").strip()
+    with db() as conn:
+        for item in entries[:100]:
+            title = val(item, "title") or val(item, "{http://www.w3.org/2005/Atom}title")
+            link = val(item, "link") or val(item, "{http://www.w3.org/2005/Atom}link")
+            if not link:
+                link_el = item.find("{http://www.w3.org/2005/Atom}link")
+                link = link_el.attrib.get("href", "") if link_el is not None else ""
+            guid = val(item, "guid") or val(item, "{http://www.w3.org/2005/Atom}id") or link or title
+            published = val(item, "pubDate") or val(item, "{http://www.w3.org/2005/Atom}published") or val(item, "{http://www.w3.org/2005/Atom}updated")
+            summary = val(item, "description") or val(item, "{http://www.w3.org/2005/Atom}summary") or val(item, "{http://www.w3.org/2005/Atom}content")
+            if not title:
+                continue
+            ident = hashlib.sha256(guid.encode("utf-8")).hexdigest()
+            cur = conn.execute("INSERT OR IGNORE INTO public_observations(id,source,title,link,published,summary,fetched) VALUES(?,?,?,?,?,?,?)",
+                (ident,"tail.bet / Stake public high-roller feed",title,link,published,summary[:4000],fetched))
+            added += cur.rowcount
+    return {"source":"tail.bet / Stake public high-roller feed","fetched_entries":len(entries),"new_entries":added,"fetched_at":fetched,"classification":"public high-roller observations; not Asian bookmaker market totals"}
+
+@app.post("/api/observations/tailbet/refresh")
+def refresh_tailbet_endpoint():
+    try:
+        return refresh_tailbet()
+    except Exception as exc:
+        raise HTTPException(502, "tail.bet RSS fetch failed: " + str(exc)[:300])
+
+@app.get("/api/observations")
+def public_observations(limit: int = 50):
+    limit = max(1, min(limit, 100))
+    with db() as conn:
+        rows = conn.execute("SELECT source,title,link,published,summary,fetched FROM public_observations ORDER BY fetched DESC LIMIT ?", (limit,)).fetchall()
+    return {"classification":"Public observations only; excluded from accepted-bet market totals and percentage alerts.","items":[dict(r) for r in rows]}
+
+
 @app.get("/",response_class=HTMLResponse)
 def home(): return HTMLResponse(Path("app/index.html").read_text())
 
 @app.get("/api/health")
 def health():
     with db() as c: n=c.execute("SELECT COUNT(*) FROM bets").fetchone()[0]
-    return {"status":"ok","version":"0.4","connected_live_sources":0,"telegram_configured":bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID")),"validated_bet_records":n,"message":"No full Asian bookmaker accepted-bets feed is connected."}
+    return {"status":"ok","version":"0.5","connected_live_sources":0,"telegram_configured":bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID")),"validated_bet_records":n,"message":"No full Asian bookmaker accepted-bets feed is connected."}
 
 @app.get("/api/config")
 def get_config(): return cfg()
