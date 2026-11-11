@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field, field_validator
 DATA = Path(os.getenv("DATA_DIR", "/data"))
 DATA.mkdir(parents=True, exist_ok=True)
 DB = DATA / "scanner.sqlite3"
-app = FastAPI(title="Asian Money Scanner", version="0.5")
+app = FastAPI(title="Asian Money Scanner", version="0.6")
 TAIL_RSS = os.getenv("TAILBET_RSS_URL", "https://tail.bet/feed.xml")
 DEFAULT = {"min_stake_eur":1000,"min_bet_share_pct":20,"min_market_share_pct":85,"min_market_pool_eur":5000,"region":"all","market":"all"}
 
@@ -48,6 +48,7 @@ def init():
     with db() as c:
         c.execute("CREATE TABLE IF NOT EXISTS bets(id INTEGER PRIMARY KEY, source TEXT, bet_id TEXT, payload TEXT, created TEXT, UNIQUE(source,bet_id))")
         c.execute("CREATE TABLE IF NOT EXISTS public_observations(id TEXT PRIMARY KEY, source TEXT, title TEXT, link TEXT, published TEXT, summary TEXT, fetched TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS exchange_snapshots(id INTEGER PRIMARY KEY AUTOINCREMENT, market_id TEXT, market_name TEXT, event_name TEXT, total_matched REAL, runners_json TEXT, captured TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS config(id INTEGER PRIMARY KEY CHECK(id=1), payload TEXT)")
         c.execute("INSERT OR IGNORE INTO config VALUES(1,?)",(json.dumps(DEFAULT),))
 init()
@@ -144,13 +145,82 @@ def public_observations(limit: int = 50):
     return {"classification":"Public observations only; excluded from accepted-bet market totals and percentage alerts.","items":[dict(r) for r in rows]}
 
 
+
+BETFAIR_URL = os.getenv("BETFAIR_API_URL", "https://api.betfair.com/exchange/betting/json-rpc/v1")
+
+def betfair_call(method, params):
+    app_key = os.getenv("BETFAIR_APP_KEY")
+    session = os.getenv("BETFAIR_SESSION_TOKEN")
+    if not app_key or not session:
+        raise HTTPException(424, "Betfair API credentials are not configured. Add BETFAIR_APP_KEY and BETFAIR_SESSION_TOKEN in Railway Variables.")
+    payload = json.dumps({"jsonrpc":"2.0","method":"SportsAPING/v1.0/"+method,"params":params,"id":1}).encode()
+    req = urllib.request.Request(BETFAIR_URL, data=payload, headers={
+        "X-Application":app_key,"X-Authentication":session,
+        "Accept":"application/json","Content-Type":"application/json"
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            result=json.loads(response.read().decode())
+    except Exception as exc:
+        raise HTTPException(502, "Betfair API request failed: "+str(exc)[:250])
+    if isinstance(result, dict) and result.get("error"):
+        raise HTTPException(502, "Betfair API error: "+str(result["error"])[:300])
+    if isinstance(result, dict) and "result" in result:
+        return result["result"]
+    raise HTTPException(502, "Unexpected Betfair API response")
+
+@app.get("/api/exchange/status")
+def exchange_status():
+    configured=bool(os.getenv("BETFAIR_APP_KEY") and os.getenv("BETFAIR_SESSION_TOKEN"))
+    return {"provider":"Betfair Exchange","configured":configured,"mode":"read_only","credentials_required":["BETFAIR_APP_KEY","BETFAIR_SESSION_TOKEN"],"warning":"Exchange traded volume and available liquidity are not sportsbook accepted bets."}
+
+@app.get("/api/exchange/soccer-markets")
+def exchange_soccer_markets(max_results: int = 30):
+    max_results=max(1,min(max_results,100))
+    events=betfair_call("listEventTypes",{"filter":{"eventTypeNames":["Soccer"]}})
+    soccer_id=next((x.get("eventType",{}).get("id") for x in events if x.get("eventType",{}).get("name","").lower()=="soccer"),None)
+    if not soccer_id:
+        return {"provider":"Betfair Exchange","markets":[]}
+    catalogue=betfair_call("listMarketCatalogue",{
+        "filter":{"eventTypeIds":[soccer_id],"marketTypeCodes":["MATCH_ODDS"],"marketStartTime":{"from":datetime.now(timezone.utc).isoformat()}},
+        "marketProjection":["EVENT","COMPETITION","RUNNER_DESCRIPTION","MARKET_START_TIME"],
+        "sort":"FIRST_TO_START","maxResults":max_results
+    })
+    return {"provider":"Betfair Exchange","mode":"read_only","markets":[{"market_id":m.get("marketId"),"market_name":m.get("marketName"),"event":m.get("event",{}).get("name"),"competition":m.get("competition",{}).get("name"),"start_time":m.get("marketStartTime"),"runners":[{"selection_id":r.get("selectionId"),"name":r.get("runnerName")} for r in m.get("runners",[])]} for m in catalogue]}
+
+@app.post("/api/exchange/market-book")
+def exchange_market_book(payload: dict):
+    market_id=str(payload.get("market_id","")).strip()
+    if not market_id or len(market_id)>40:
+        raise HTTPException(400,"A valid market_id is required.")
+    book=betfair_call("listMarketBook",{"marketIds":[market_id],"priceProjection":{"priceData":["EX_BEST_OFFERS","EX_TRADED"],"virtualise":True}})
+    if not book:
+        return {"provider":"Betfair Exchange","market_id":market_id,"available":False}
+    m=book[0]
+    runners=[]
+    for r in m.get("runners",[]):
+        ex=r.get("ex",{})
+        runners.append({"selection_id":r.get("selectionId"),"status":r.get("status"),"last_price_traded":r.get("lastPriceTraded"),"available_to_back":ex.get("availableToBack",[])[:3],"available_to_lay":ex.get("availableToLay",[])[:3],"traded_volume":ex.get("tradedVolume",[])[:10]})
+    captured=datetime.now(timezone.utc).isoformat()
+    with db() as conn:
+        conn.execute("INSERT INTO exchange_snapshots(market_id,market_name,event_name,total_matched,runners_json,captured) VALUES(?,?,?,?,?,?)",(market_id,m.get("marketName",""),payload.get("event",""),float(m.get("totalMatched",0) or 0),json.dumps(runners),captured))
+    return {"provider":"Betfair Exchange","classification":"exchange prices, available liquidity and matched turnover; NOT sportsbook accepted bets","market_id":market_id,"status":m.get("status"),"total_matched":m.get("totalMatched",0),"currency":payload.get("currency","GBP"),"runners":runners,"captured_at":captured}
+
+@app.get("/api/exchange/snapshots")
+def exchange_snapshots(limit: int = 30):
+    limit=max(1,min(limit,100))
+    with db() as conn:
+        rows=conn.execute("SELECT market_id,market_name,event_name,total_matched,runners_json,captured FROM exchange_snapshots ORDER BY id DESC LIMIT ?",(limit,)).fetchall()
+    return {"classification":"Betfair Exchange data only; excluded from sportsbook stake totals.","items":[{"market_id":r["market_id"],"market_name":r["market_name"],"event":r["event_name"],"total_matched":r["total_matched"],"runners":json.loads(r["runners_json"]),"captured_at":r["captured"]} for r in rows]}
+
+
 @app.get("/",response_class=HTMLResponse)
 def home(): return HTMLResponse(Path("app/index.html").read_text())
 
 @app.get("/api/health")
 def health():
     with db() as c: n=c.execute("SELECT COUNT(*) FROM bets").fetchone()[0]
-    return {"status":"ok","version":"0.5","connected_live_sources":0,"telegram_configured":bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID")),"validated_bet_records":n,"message":"No full Asian bookmaker accepted-bets feed is connected."}
+    return {"status":"ok","version":"0.6","connected_live_sources":0,"telegram_configured":bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID")),"validated_bet_records":n,"message":"No full Asian bookmaker accepted-bets feed is connected."}
 
 @app.get("/api/config")
 def get_config(): return cfg()
