@@ -1,6 +1,7 @@
 from __future__ import annotations
-import json, os, sqlite3, urllib.parse, urllib.request, xml.etree.ElementTree as ET, hashlib
-from datetime import datetime, timezone
+import json, os, sqlite3, urllib.parse, urllib.request, xml.etree.ElementTree as ET, hashlib, asyncio
+from datetime import datetime, timezone, time as dtime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Optional
 from fastapi import FastAPI, HTTPException
@@ -144,6 +145,58 @@ def public_observations(limit: int = 50):
         rows = conn.execute("SELECT source,title,link,published,summary,fetched FROM public_observations ORDER BY fetched DESC LIMIT ?", (limit,)).fetchall()
     return {"classification":"Public observations only; excluded from accepted-bet market totals and percentage alerts.","items":[dict(r) for r in rows]}
 
+
+
+# Automated collection and morning Telegram briefing (Warsaw time).
+WARSAW = ZoneInfo("Europe/Warsaw")
+
+def morning_briefing():
+    with db() as conn:
+        rows = conn.execute("SELECT title,link,published,summary FROM public_observations ORDER BY COALESCE(published,fetched) DESC LIMIT 12").fetchall()
+        qualified = conn.execute("SELECT payload FROM bets ORDER BY id DESC LIMIT 100").fetchall()
+    lines = ["ASIAN MONEY SCANNER — PORANNY RAPORT", "Źródło publiczne: tail.bet / Stake; to obserwacje wybranych kuponów, nie pełny rynek azjatycki."]
+    if rows:
+        lines.append("\nPUBLICZNE OBSERWACJE:")
+        for row in rows[:8]:
+            lines.append("• " + row["title"][:180] + (("\n" + row["link"][:250]) if row["link"] else ""))
+    else:
+        lines.append("\nBrak nowych publicznych obserwacji. Nie ma potwierdzonego typu.")
+    verified = []
+    for row in qualified:
+        try:
+            bet = Bet(**json.loads(row["payload"]))
+            result = assess(bet, cfg())
+            if result["qualified"]:
+                verified.append((bet, result))
+        except Exception:
+            continue
+    if verified:
+        lines.append("\nZWERYFIKOWANE ZGŁOSZENIA ACCEPTED BETS:")
+        for bet, result in verified[:5]:
+            lines.append(f"• {bet.event} — {bet.market}: {bet.selection}; {bet.stake:g} {bet.currency}; kurs {bet.odds or 'brak'}; źródło {bet.source}")
+    else:
+        lines.append("\nBRAK ZWERYFIKOWANYCH ACCEPTED BETS — brak rekomendacji do zagrania.")
+    lines.append("\nNie traktuj publicznych obserwacji jako potwierdzenia przepływu pieniędzy na całym rynku.")
+    sent, status = notify("\n".join(lines))
+    print("MORNING_BRIEFING: " + ("sent" if sent else status))
+
+async def automated_collection():
+    last_briefing_date = None
+    while True:
+        try:
+            result = await asyncio.to_thread(refresh_tailbet)
+            print("TAILBET_AUTO_REFRESH: " + json.dumps(result, ensure_ascii=False))
+        except Exception as exc:
+            print("TAILBET_AUTO_REFRESH_FAILED: " + str(exc)[:300])
+        now = datetime.now(WARSAW)
+        if now.time() >= dtime(7, 0) and last_briefing_date != now.date():
+            await asyncio.to_thread(morning_briefing)
+            last_briefing_date = now.date()
+        await asyncio.sleep(300)
+
+@app.on_event("startup")
+async def start_automated_collection():
+    asyncio.create_task(automated_collection())
 
 
 BETFAIR_URL = os.getenv("BETFAIR_API_URL", "https://api.betfair.com/exchange/betting/json-rpc/v1")
