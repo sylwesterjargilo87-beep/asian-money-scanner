@@ -78,6 +78,23 @@ def notify(msg):
         return True,"sent"
     except Exception as e: return False,str(e)
 
+
+@app.on_event("startup")
+def telegram_startup_test():
+    # Send one real connection test after the user explicitly requested it.
+    with db() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS telegram_test (id INTEGER PRIMARY KEY CHECK(id=1), sent_at TEXT)")
+        row = conn.execute("SELECT sent_at FROM telegram_test WHERE id=1").fetchone()
+    if row:
+        return
+    sent, status = notify("Asian Money Scanner: Telegram connection test successful. Bot is connected.")
+    if sent:
+        with db() as conn:
+            conn.execute("INSERT OR IGNORE INTO telegram_test(id, sent_at) VALUES(1, ?)", (datetime.now(timezone.utc).isoformat(),))
+    else:
+        print("TELEGRAM_STARTUP_TEST_FAILED: " + status)
+
+
 @app.get("/",response_class=HTMLResponse)
 def home(): return HTMLResponse(Path("app/index.html").read_text())
 
