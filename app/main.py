@@ -113,3 +113,26 @@ def ingest(b:Bet):
 def records():
     with db() as c: rows=c.execute("SELECT payload,created FROM bets ORDER BY id DESC LIMIT 100").fetchall()
     return [{"record":json.loads(x["payload"]),"received_at":x["created"],"assessment":assess(Bet(**json.loads(x["payload"])),cfg())} for x in rows]
+
+@app.get("/api/metrics/volume")
+def volume(window_seconds: int = 60):
+    if window_seconds < 1 or window_seconds > 3600:
+        raise HTTPException(400, "window_seconds must be between 1 and 3600")
+    cutoff = datetime.now(timezone.utc).timestamp() - window_seconds
+    with db() as c:
+        rows = c.execute("SELECT payload, created FROM bets WHERE created >= ?", (datetime.fromtimestamp(cutoff, timezone.utc).isoformat(),)).fetchall()
+    totals = {}
+    for row in rows:
+        record = json.loads(row["payload"])
+        currency = record.get("currency", "UNKNOWN")
+        bucket = totals.setdefault(currency, {"currency": currency, "stake_volume": 0.0, "bets": 0})
+        bucket["stake_volume"] += float(record.get("stake", 0))
+        bucket["bets"] += 1
+    return {
+        "window_seconds": window_seconds,
+        "basis": "records_received_by_scanner",
+        "definition": "Sum of unique validated accepted-bet stakes first received during the rolling window; currencies are kept separate, no FX conversion.",
+        "bets_count": len(rows),
+        "by_currency": [{**v, "stake_volume": round(v["stake_volume"], 2)} for v in sorted(totals.values(), key=lambda x: x["currency"])],
+        "as_of": datetime.now(timezone.utc).isoformat()
+    }
