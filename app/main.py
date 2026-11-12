@@ -1,11 +1,12 @@
 from __future__ import annotations
-import json, os, sqlite3, urllib.parse, urllib.request, xml.etree.ElementTree as ET, hashlib
+import asyncio, json, os, sqlite3, urllib.parse, urllib.request, xml.etree.ElementTree as ET, hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, field_validator
+from app import odds_scanner
 
 DATA = Path(os.getenv("DATA_DIR", "/data"))
 DATA.mkdir(parents=True, exist_ok=True)
@@ -213,6 +214,47 @@ def exchange_snapshots(limit: int = 30):
         rows=conn.execute("SELECT market_id,market_name,event_name,total_matched,runners_json,captured FROM exchange_snapshots ORDER BY id DESC LIMIT ?",(limit,)).fetchall()
     return {"classification":"Betfair Exchange data only; excluded from sportsbook stake totals.","items":[{"market_id":r["market_id"],"market_name":r["market_name"],"event":r["event_name"],"total_matched":r["total_matched"],"runners":json.loads(r["runners_json"]),"captured_at":r["captured"]} for r in rows]}
 
+
+
+_odds_task = None
+
+async def _odds_poll_loop():
+    odds_scanner.init()
+    while True:
+        result = await asyncio.to_thread(odds_scanner.poll, notify)
+        print("ODDS_SCANNER_POLL: " + json.dumps(result, ensure_ascii=False))
+        await asyncio.sleep(max(30, int(os.getenv("ODDS_POLL_SECONDS", "60"))))
+
+@app.on_event("startup")
+async def start_odds_scanner():
+    global _odds_task
+    _odds_task = asyncio.create_task(_odds_poll_loop())
+
+@app.on_event("shutdown")
+async def stop_odds_scanner():
+    global _odds_task
+    if _odds_task:
+        _odds_task.cancel()
+        try:
+            await _odds_task
+        except asyncio.CancelledError:
+            pass
+
+@app.get("/api/odds/status")
+def odds_status():
+    return odds_scanner.status()
+
+@app.get("/api/odds/matches")
+def odds_matches(limit: int = 100):
+    return {"source": "MoviOdds (bet365)", "classification": "Asian Handicap and Over/Under odds only; not accepted bet amounts.", "items": odds_scanner.matches(limit)}
+
+@app.get("/api/odds/alerts")
+def odds_alerts(limit: int = 50):
+    return {"classification": "Odds movement alerts only; not evidence of accepted stakes.", "items": odds_scanner.alerts(limit)}
+
+@app.post("/api/odds/refresh")
+async def odds_refresh():
+    return await asyncio.to_thread(odds_scanner.poll, notify)
 
 @app.get("/",response_class=HTMLResponse)
 def home(): return HTMLResponse(Path("app/index.html").read_text())
