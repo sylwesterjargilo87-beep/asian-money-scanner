@@ -216,29 +216,17 @@ def exchange_snapshots(limit: int = 30):
 
 
 
+# Automatic odds polling is intentionally disabled.
+# Odds movements are not accepted-bet amounts and must never generate stake alerts.
 _odds_task = None
-
-async def _odds_poll_loop():
-    odds_scanner.init()
-    while True:
-        result = await asyncio.to_thread(odds_scanner.poll, notify)
-        print("ODDS_SCANNER_POLL: " + json.dumps(result, ensure_ascii=False))
-        await asyncio.sleep(max(30, int(os.getenv("ODDS_POLL_SECONDS", "60"))))
 
 @app.on_event("startup")
 async def start_odds_scanner():
-    global _odds_task
-    _odds_task = asyncio.create_task(_odds_poll_loop())
+    print("ODDS_SCANNER_DISABLED: no automatic odds polling or odds-based alerts.")
 
 @app.on_event("shutdown")
 async def stop_odds_scanner():
-    global _odds_task
-    if _odds_task:
-        _odds_task.cancel()
-        try:
-            await _odds_task
-        except asyncio.CancelledError:
-            pass
+    return
 
 @app.get("/api/odds/status")
 def odds_status():
