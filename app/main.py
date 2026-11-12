@@ -254,7 +254,7 @@ def matchbook_request(path, params=None):
         raise HTTPException(424, "MATCHBOOK_USERNAME and MATCHBOOK_PASSWORD are not configured.")
     body=json.dumps({"username":username,"password":password}).encode()
     login_req=urllib.request.Request(
-        MATCHBOOK_BASE + "/v2/login", data=body,
+        "https://api.matchbook.com/bpapi/rest/security/session", data=body,
         headers={"Accept":"application/json","Content-Type":"application/json","User-Agent":"AsianMoneyScanner/0.8"}
     )
     try:
@@ -279,7 +279,7 @@ def matchbook_status():
     return {
         "provider":"Matchbook Exchange",
         "configured":bool(os.getenv("MATCHBOOK_USERNAME") and os.getenv("MATCHBOOK_PASSWORD")),
-        "matched_bets_endpoint":"/api/v2/matched-bets/aggregated",
+        "matched_bets_endpoint":"/api/v2/offers?status=matched&aggregation-type=summary",
         "classification":"peer-to-peer exchange matched bets; NOT bookmaker accepted bets",
         "automatic_alerts":False
     }
@@ -296,10 +296,12 @@ def matchbook_matched_bets(event_ids: Optional[str]=None, market_ids: Optional[s
     if event_ids: params["event-ids"]=event_ids
     if market_ids: params["market-ids"]=market_ids
     if side: params["side"]=side
-    payload=matchbook_request("/v2/matched-bets/aggregated",params)
+    params["status"]="matched"
+    params["aggregation-type"]="summary"
+    payload=matchbook_request("/v2/offers",params)
     return {
         "provider":"Matchbook Exchange",
-        "classification":"aggregated matched exchange bets; NOT total Asian bookmaker accepted stakes",
+        "classification":"aggregated matched offers belonging to the authenticated Matchbook account; NOT whole-exchange turnover or Asian bookmaker accepted stakes",
         "automatic_alerts":False,
         "data":payload
     }
