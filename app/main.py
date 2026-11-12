@@ -304,6 +304,46 @@ def matchbook_matched_bets(event_ids: Optional[str]=None, market_ids: Optional[s
         "data":payload
     }
 
+
+# Public, read-only Matchbook market discovery (no account credentials required).
+# Public events/prices are NOT matched turnover and cannot trigger stake alerts.
+@app.get("/api/exchange/matchbook/public-soccer")
+def matchbook_public_soccer(per_page: int = 100):
+    per_page=max(1,min(per_page,200))
+    params={
+        "per-page":per_page,
+        "states":"open,suspended",
+        "include-prices":"true",
+        "exchange-type":"back-lay",
+        "odds-type":"DECIMAL",
+        "currency":"EUR",
+        "include-event-participants":"true"
+    }
+    url="https://api.matchbook.com/edge/rest/events?"+urllib.parse.urlencode(params)
+    req=urllib.request.Request(url,headers={"Accept":"application/json","User-Agent":"AsianMoneyScanner/0.8"})
+    try:
+        with urllib.request.urlopen(req,timeout=20) as response:
+            payload=json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(502,"Matchbook public events request failed: "+str(exc)[:250])
+    events=payload.get("events",[]) if isinstance(payload,dict) else []
+    soccer=[]
+    for e in events:
+        category=str(e.get("sport",{}).get("name","") if isinstance(e.get("sport"),dict) else e.get("sport","")).lower()
+        name=str(e.get("name","")).lower()
+        if category not in ("soccer","football") and " v " not in name and " vs " not in name:
+            continue
+        if any(t in name for t in ("esoccer","e-soccer","virtual","simulated")):
+            continue
+        soccer.append(e)
+    return {
+        "provider":"Matchbook Exchange",
+        "classification":"public exchange events and order-book prices; NOT matched turnover or bookmaker accepted stakes",
+        "automatic_alerts":False,
+        "events_count":len(soccer),
+        "events":soccer
+    }
+
 @app.get("/api/exchange/status")
 def exchange_status():
     configured=bool(os.getenv("BETFAIR_APP_KEY") and os.getenv("BETFAIR_SESSION_TOKEN"))
