@@ -242,6 +242,68 @@ def fourcasters_soccer():
         "note": "Available liquidity and matched exchange turnover are distinct. No alert is generated until the matched-volume field and currency are verified."
     }
 
+
+# Matchbook Exchange: official API with aggregated matched-bets endpoint.
+# Exchange matched bets are explicitly kept separate from bookmaker accepted stakes.
+MATCHBOOK_BASE = os.getenv("MATCHBOOK_API_BASE", "https://api.matchbook.com/edge/rest")
+
+def matchbook_request(path, params=None):
+    username=os.getenv("MATCHBOOK_USERNAME")
+    password=os.getenv("MATCHBOOK_PASSWORD")
+    if not username or not password:
+        raise HTTPException(424, "MATCHBOOK_USERNAME and MATCHBOOK_PASSWORD are not configured.")
+    body=json.dumps({"username":username,"password":password}).encode()
+    login_req=urllib.request.Request(
+        MATCHBOOK_BASE + "/v2/login", data=body,
+        headers={"Accept":"application/json","Content-Type":"application/json","User-Agent":"AsianMoneyScanner/0.8"}
+    )
+    try:
+        with urllib.request.urlopen(login_req, timeout=15) as response:
+            login=json.loads(response.read().decode("utf-8"))
+            token=response.headers.get("session-token") or login.get("session-token") or login.get("sessionToken")
+        if not token:
+            raise ValueError("Matchbook login returned no session token.")
+        url=MATCHBOOK_BASE + path
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+        req=urllib.request.Request(url, headers={
+            "session-token":token,"Accept":"application/json","User-Agent":"AsianMoneyScanner/0.8"
+        })
+        with urllib.request.urlopen(req, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(502, "Matchbook API request failed: " + str(exc)[:250])
+
+@app.get("/api/exchange/matchbook/status")
+def matchbook_status():
+    return {
+        "provider":"Matchbook Exchange",
+        "configured":bool(os.getenv("MATCHBOOK_USERNAME") and os.getenv("MATCHBOOK_PASSWORD")),
+        "matched_bets_endpoint":"/api/v2/matched-bets/aggregated",
+        "classification":"peer-to-peer exchange matched bets; NOT bookmaker accepted bets",
+        "automatic_alerts":False
+    }
+
+@app.get("/api/exchange/matchbook/matched-bets")
+def matchbook_matched_bets(event_ids: Optional[str]=None, market_ids: Optional[str]=None,
+                           side: Optional[str]=None, aggregation_type: str="summary",
+                           offset: int=0, per_page: int=100):
+    if aggregation_type not in ("average","summary"):
+        raise HTTPException(400,"aggregation_type must be average or summary")
+    if side and side not in ("back","lay","win","lose"):
+        raise HTTPException(400,"side must be back, lay, win or lose")
+    params={"offset":max(0,offset),"per-page":max(1,min(500,per_page)),"aggregation-type":aggregation_type}
+    if event_ids: params["event-ids"]=event_ids
+    if market_ids: params["market-ids"]=market_ids
+    if side: params["side"]=side
+    payload=matchbook_request("/v2/matched-bets/aggregated",params)
+    return {
+        "provider":"Matchbook Exchange",
+        "classification":"aggregated matched exchange bets; NOT total Asian bookmaker accepted stakes",
+        "automatic_alerts":False,
+        "data":payload
+    }
+
 @app.get("/api/exchange/status")
 def exchange_status():
     configured=bool(os.getenv("BETFAIR_APP_KEY") and os.getenv("BETFAIR_SESSION_TOKEN"))
