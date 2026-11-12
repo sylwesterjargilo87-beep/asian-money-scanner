@@ -170,6 +170,78 @@ def betfair_call(method, params):
         return result["result"]
     raise HTTPException(502, "Unexpected Betfair API response")
 
+
+# Owls Insight / 4casters exchange feed.
+# This is exchange data, not bookmaker accepted-bet records. Never mix it into
+# bookmaker stake totals. The API key is supplied as a Railway environment variable.
+OWLS_BASE_URL = os.getenv("OWLS_INSIGHT_BASE_URL", "https://api.owlsinsight.com")
+
+@app.get("/api/exchange/4casters/status")
+def fourcasters_status():
+    return {
+        "provider": "Owls Insight Source API / 4casters",
+        "configured": bool(os.getenv("OWLS_INSIGHT_API_KEY")),
+        "endpoint": "/api/v2/4casters/soccer",
+        "classification": "peer-to-peer exchange order book; matched exchange turnover where explicitly supplied; NOT bookmaker accepted bets",
+        "automatic_alerts": False,
+        "note": "No API key configured means no live data is fetched. Exchange volume is kept separate from bookmaker accepted stakes."
+    }
+
+@app.get("/api/exchange/4casters/soccer")
+def fourcasters_soccer():
+    api_key = os.getenv("OWLS_INSIGHT_API_KEY")
+    if not api_key:
+        raise HTTPException(424, "OWLS_INSIGHT_API_KEY is not configured.")
+    url = OWLS_BASE_URL.rstrip("/") + "/api/v2/4casters/soccer"
+    req = urllib.request.Request(url, headers={
+        "Authorization": "Bearer " + api_key,
+        "Accept": "application/json",
+        "User-Agent": "AsianMoneyScanner/0.7"
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(502, "4casters feed request failed: " + str(exc)[:250])
+    data = payload.get("data", {}) if isinstance(payload, dict) else {}
+    if not isinstance(data, dict):
+        raise HTTPException(502, "Unexpected 4casters response: data is not an object.")
+    events = []
+    for event_id, event in data.items():
+        if not isinstance(event, dict):
+            continue
+        # Explicitly reject esports, virtual and non-soccer records.
+        sport = str(event.get("sport", "")).lower()
+        league = str(event.get("league", "")).lower()
+        if sport not in ("soccer", "football"):
+            continue
+        if any(term in league for term in ("esport", "e-soccer", "esoccer", "virtual", "simulated")):
+            continue
+        events.append({
+            "event_id": event.get("id", event_id),
+            "event": event.get("eventName"),
+            "league": event.get("league"),
+            "start": event.get("start"),
+            "live": event.get("live"),
+            "markets": {
+                "homeMoneylines": event.get("homeMoneylines", []),
+                "awayMoneylines": event.get("awayMoneylines", []),
+                "homeSpreads": event.get("homeSpreads", {}),
+                "awaySpreads": event.get("awaySpreads", {}),
+                "over": event.get("over", {}),
+                "under": event.get("under", {})
+            }
+        })
+    return {
+        "provider": "Owls Insight Source API / 4casters",
+        "classification": "exchange order-book data; not bookmaker accepted stakes",
+        "automatic_alerts": False,
+        "events_returned": len(events),
+        "events": events,
+        "meta": payload.get("meta", {}),
+        "note": "Available liquidity and matched exchange turnover are distinct. No alert is generated until the matched-volume field and currency are verified."
+    }
+
 @app.get("/api/exchange/status")
 def exchange_status():
     configured=bool(os.getenv("BETFAIR_APP_KEY") and os.getenv("BETFAIR_SESSION_TOKEN"))
